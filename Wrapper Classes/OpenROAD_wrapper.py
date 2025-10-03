@@ -131,6 +131,84 @@ class OpenROADGUIWrapper:
         except Exception as e:
             raise OpenROADWrapperError(f"Unexpected error: {str(e)}") from e
 
+    def run_script_terminal(self, script_path):
+        """Run OpenROAD in terminal (headless) mode with the given TCL script and return stdout."""
+        if not self.openroad_path:
+            raise OpenROADWrapperError("OpenROAD executable not found.")
+
+        if not os.path.exists(script_path):
+            raise OpenROADWrapperError(f"TCL script file not found: {script_path}")
+
+        script_dir = os.path.dirname(os.path.abspath(script_path))
+        script_name = os.path.basename(script_path)
+
+        if self.use_wsl:
+            cmd = self._run_command_with_wsl([self.openroad_path, script_name], working_dir=script_dir)
+        else:
+            cmd = [self.openroad_path, script_path]
+
+        try:
+            print(f"Running OpenROAD in terminal from: {script_dir}")
+            print(f"Script: {script_name}")
+
+            if self.use_wsl:
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            else:
+                result = subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=script_dir)
+
+            return result.stdout
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr or ""
+            stdout = e.stdout or ""
+            raise OpenROADWrapperError(f"OpenROAD terminal failed (code {e.returncode}). Stdout/Err captured.") from e
+        except Exception as e:
+            raise OpenROADWrapperError(f"Unexpected error: {str(e)}") from e
+
+    def write_basic_flow_tcl(self,
+                              tcl_path,
+                              design_name,
+                              verilog_path,
+                              top_module,
+                              tech_lef_path,
+                              lib_lef_path,
+                              liberty_path,
+                              sdc_path=None,
+                              die_area="0 0 100 100",
+                              core_area="10 10 90 90"):
+        """Generate a minimal OpenROAD TCL for floorplan, place, CTS, and route.
+
+        Note: Requires a consistent PDK/lib set (LEF/Liberty) matching the synthesized cells.
+        """
+        lines = []
+        lines.append(f"set design_name {design_name}")
+        lines.append(f"set top_module {top_module}")
+        lines.append("")
+        lines.append(f"read_lef {tech_lef_path}")
+        lines.append(f"read_lef {lib_lef_path}")
+        lines.append(f"read_liberty {liberty_path}")
+        lines.append(f"read_verilog {verilog_path}")
+        lines.append("link_design $top_module")
+        lines.append("")
+        if sdc_path:
+            lines.append(f"read_sdc {sdc_path}")
+        lines.append("")
+        lines.append(f"initialize_floorplan -die_area {{{die_area}}} -core_area {{{core_area}}}")
+        lines.append("tapcell -distance 14 -tapcell_master TAPCELL_X1 -endcap_master TAPCELL_X1")
+        lines.append("global_placement -routability_driven")
+        lines.append("detailed_placement")
+        lines.append("clock_tree_synthesis -root_buf CLKBUF_X3 -buf_list {CLKBUF_X1 CLKBUF_X2 CLKBUF_X3}")
+        lines.append("global_routing")
+        lines.append("detailed_routing")
+        lines.append("")
+        lines.append("write_def ${design_name}.def")
+        lines.append("write_verilog ${design_name}_placed.v")
+        lines.append("report_checks -path_delay min_max > timing.rpt")
+
+        os.makedirs(os.path.dirname(os.path.abspath(tcl_path)), exist_ok=True)
+        with open(tcl_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines))
+        return tcl_path
+
     def find_tcl_scripts(self, search_dir=r"D:\OpenROAD"):
         """Find TCL scripts in the OpenROAD directory."""
         tcl_scripts = []

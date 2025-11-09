@@ -1,0 +1,549 @@
+import subprocess
+import os
+import sys
+import time
+import shutil
+from pathlib import Path
+from typing import List, Optional
+from dataclasses import dataclass
+
+
+class OpenROADWrapperError(Exception):
+    """Custom exception for OpenROAD wrapper errors."""
+    pass
+
+
+@dataclass
+class OpenROADResult:
+    """Result of OpenROAD execution."""
+    success: bool
+    stage: str
+    output_file: Optional[str] = None
+    sta_report_file: Optional[str] = None
+    execution_time: float = 0.0
+    stdout: str = ""
+    stderr: str = ""
+    messages: List[str] = None
+
+    def __post_init__(self):
+        if self.messages is None:
+            self.messages = []
+
+
+class OpenROADWrapper:
+    def __init__(self):
+        self.openroad_path = None
+        self.use_wsl = False
+        self._find_openroad_executable()
+        if self.openroad_path:
+            mode = " (via WSL)" if self.use_wsl else ""
+            print(f"✅ OpenROAD found{mode}\n")
+        else:
+            print("❌ OpenROAD executable not found\n")
+
+    def _check_wsl_available(self) -> bool:
+        try:
+            subprocess.run(['wsl', '--status'], capture_output=True, text=True, timeout=5)
+            return True
+        except Exception:
+            return False
+
+    def _convert_windows_path_to_wsl(self, windows_path: str) -> str:
+        if windows_path.startswith('D:'):
+            return windows_path.replace('D:', '/mnt/d').replace('\\', '/')
+        elif windows_path.startswith('C:'):
+            return windows_path.replace('C:', '/mnt/c').replace('\\', '/')
+        else:
+            drive = windows_path[0].lower()
+            return windows_path.replace(f'{drive.upper()}:', f'/mnt/{drive}').replace('\\', '/')
+
+    def _test_linux_executable_with_wsl(self, filepath: str) -> bool:
+        if not self._check_wsl_available():
+            return False
+        wsl_path = self._convert_windows_path_to_wsl(filepath)
+        try:
+            result = subprocess.run(['wsl', wsl_path, '--version'], capture_output=True, text=True, timeout=10)
+            return result.returncode == 0 or "openroad" in result.stdout.lower()
+        except Exception:
+            return False
+
+    def _find_openroad_executable(self):
+        openroad_base_dir = r"D:\OpenROAD"
+        linux_executable_paths = [
+            os.path.join(openroad_base_dir, "build", "src", "openroad"),
+            os.path.join(openroad_base_dir, "build/src/openroad"),
+            os.path.join(openroad_base_dir, "bin", "openroad"),
+            os.path.join(openroad_base_dir, "openroad"),
+        ]
+        if not self._check_wsl_available():
+            print("⚠️  WSL not available - cannot run OpenROAD")
+            return
+        for path in linux_executable_paths:
+            if os.path.exists(path) and self._test_linux_executable_with_wsl(path):
+                self.openroad_path = path
+                self.use_wsl = True
+                return
+
+    def _run_command_with_wsl(self, cmd_args: List[str], working_dir: Optional[str] = None) -> List[str]:
+        wsl_openroad_path = self._convert_windows_path_to_wsl(self.openroad_path)
+        wsl_cmd_args = []
+        for arg in cmd_args[1:]:
+            if os.path.exists(arg) and '\\' in arg:
+                wsl_cmd_args.append(self._convert_windows_path_to_wsl(arg))
+            else:
+                wsl_cmd_args.append(arg)
+        if working_dir:
+            wsl_working_dir = self._convert_windows_path_to_wsl(working_dir)
+            full_cmd = ['wsl', 'bash', '-c', f'cd "{wsl_working_dir}" && "{wsl_openroad_path}" {" ".join(wsl_cmd_args)}']
+        else:
+            full_cmd = ['wsl', wsl_openroad_path] + wsl_cmd_args
+        return full_cmd
+
+    def find_tcl_scripts(self, search_dir: str = r"D:\OpenROAD") -> List[str]:
+        tcl_scripts = []
+        try:
+            for root, dirs, files in os.walk(search_dir):
+                for file in files:
+                    if file.endswith('.tcl'):
+                        tcl_scripts.append(os.path.join(root, file))
+        except Exception as e:
+            print(f"⚠️  Error searching for TCL scripts: {e}")
+        return tcl_scripts
+
+    def get_script_path_interactive(self) -> str:
+        print("\n" + "=" * 70)
+        print("📋 TCL SCRIPT SELECTION")
+        print("=" * 70 + "\n")
+        default_script = r"D:\OpenROAD\test\gcd_nangate45.tcl"
+        if os.path.exists(default_script):
+            print("🔹 Default script available:")
+            print(f"   {default_script}\n")
+            choice = input("Use default? (y/n, default: y): ").strip().lower()
+            if choice != 'n':
+                print(f"✅ Selected: {Path(default_script).name}\n")
+                return default_script
+
+        print("🔍 Searching for TCL scripts...")
+        tcl_scripts = self.find_tcl_scripts()
+        if tcl_scripts:
+            print(f"\n📄 Found {len(tcl_scripts)} TCL script(s):\n")
+            for i, script in enumerate(tcl_scripts[:10], 1):
+                script_name = Path(script).name
+                script_dir = Path(script).parent.name
+                print(f"   {i}. {script_name} ({script_dir}/)")
+            if len(tcl_scripts) > 10:
+                print(f"   ... and {len(tcl_scripts) - 10} more")
+            choice = input(f"\nSelect script (1-{min(len(tcl_scripts), 10)}) or press Enter to enter path: ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= min(len(tcl_scripts), 10):
+                selected = tcl_scripts[int(choice) - 1]
+                print(f"✅ Selected: {Path(selected).name}\n")
+                return selected
+
+        print("\n🔹 Enter TCL script path manually:")
+        print("   Examples:")
+        print("   - D:\\OpenROAD\\test\\gcd_nangate45.tcl")
+        print("   - D:\\OpenROAD\\examples\\example.tcl\n")
+        while True:
+            try:
+                script_path = input("Path (or 'exit' to quit): ").strip()
+                if script_path.lower() == 'exit':
+                    print("❌ Cancelled by user\n")
+                    raise KeyboardInterrupt
+                if not script_path:
+                    print("⚠️  Please enter a valid path\n")
+                    continue
+                script_path = script_path.strip('"').strip("'")
+                if os.path.exists(script_path):
+                    print(f"✅ Script found: {Path(script_path).name}\n")
+                    return script_path
+                else:
+                    print(f"❌ File not found: {script_path}\n")
+            except KeyboardInterrupt:
+                print("\n❌ Cancelled by user\n")
+                raise
+            except Exception as e:
+                print(f"❌ Error: {e}\n")
+
+    def _generate_sta_report_tcl(self, script_dir: str) -> str:
+        """Generate TCL script content for STA report."""
+        sta_tcl_content = """
+# STA Report Generation Script
+set sta_report_file "sta_report.txt"
+
+set report_fp [open $sta_report_file w]
+
+puts $report_fp "=========================================="
+puts $report_fp "Static Timing Analysis (STA) Report"
+puts $report_fp "Generated: [clock format [clock seconds]]"
+puts $report_fp ""
+
+puts $report_fp "=== Timing Checks Summary ==="
+if {[catch {report_checks} result]} {
+    puts $report_fp "Error generating timing checks: $result"
+} else {
+    puts $report_fp $result
+}
+puts $report_fp ""
+
+puts $report_fp "=== Worst Negative Slack (WNS) ==="
+if {[catch {report_worst_slack -max} wns]} {
+    puts $report_fp "WNS: Not available"
+} else {
+    puts $report_fp "WNS: $wns"
+}
+puts $report_fp ""
+
+puts $report_fp "=== Total Negative Slack (TNS) ==="
+if {[catch {report_tns -max} tns]} {
+    puts $report_fp "TNS: Not available"
+} else {
+    puts $report_fp "TNS: $tns"
+}
+puts $report_fp ""
+
+puts $report_fp "=== Critical Timing Paths ==="
+if {[catch {report_timing -max_paths 10} result]} {
+    puts $report_fp "Error generating critical paths: $result"
+} else {
+    puts $report_fp $result
+}
+puts $report_fp ""
+
+puts $report_fp "=========================================="
+
+close $report_fp
+puts "STA report generated: $sta_report_file"
+"""
+        sta_tcl_path = os.path.join(script_dir, "generate_sta_report.tcl")
+        try:
+            with open(sta_tcl_path, 'w', encoding='utf-8') as f:
+                f.write(sta_tcl_content)
+            return sta_tcl_path
+        except Exception as e:
+            print(f"⚠️  Failed to create STA generation script: {e}")
+            return None
+
+    def _generate_sta_report(self, script_path: str) -> Optional[str]:
+        """Generate STA report by sourcing the design script then the STA report script."""
+        script_dir = os.path.dirname(os.path.abspath(script_path))
+        sta_report_path = os.path.join(script_dir, "sta_report.txt")
+
+        print("📊 Generating STA report...")
+        sys.stdout.flush()
+
+        sta_tcl_path = self._generate_sta_report_tcl(script_dir)
+        if not sta_tcl_path:
+            return None
+
+        script_name = os.path.basename(script_path)
+        wrapper_tcl_path = os.path.join(script_dir, "sta_wrapper.tcl")
+
+        try:
+            with open(wrapper_tcl_path, 'w', encoding='utf-8') as f:
+                f.write(f"# Wrapper script to generate STA report\n")
+                f.write(f"if {{[file exists \"{script_name}\"]}} {{ source \"{script_name}\" }}\n")
+                f.write(f"source \"{os.path.basename(sta_tcl_path)}\"\n")
+                f.write(f"exit\n")
+        except Exception as e:
+            print(f"⚠️  Failed to create wrapper script: {e}")
+            return None
+
+        try:
+            if self.use_wsl:
+                wsl_script_dir = self._convert_windows_path_to_wsl(script_dir)
+                wsl_wrapper_path = self._convert_windows_path_to_wsl(wrapper_tcl_path)
+                wsl_openroad = self._convert_windows_path_to_wsl(self.openroad_path)
+                cmd = ['wsl', 'bash', '-c', f'cd "{wsl_script_dir}" && "{wsl_openroad}" -exit "{wsl_wrapper_path}"']
+            else:
+                cmd = [self.openroad_path, '-exit', wrapper_tcl_path]
+
+            result = subprocess.run(cmd, cwd=script_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, timeout=600)
+
+            # Clean temporary TCLs
+            for temp_file in [sta_tcl_path, wrapper_tcl_path]:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except:
+                    pass
+
+            if os.path.exists(sta_report_path) and os.path.getsize(sta_report_path) > 0:
+                print("✅ STA report generated successfully")
+                return sta_report_path
+            else:
+                print("⚠️  STA report completed but file not found or empty")
+                if result.stderr:
+                    print(f"Error output (truncated): {result.stderr[:500]}")
+                return None
+        except subprocess.TimeoutExpired:
+            print("❌ STA report generation timed out")
+            return None
+        except Exception as e:
+            print(f"❌ Error generating STA report: {e}")
+            return None
+        finally:
+            for temp_file in [sta_tcl_path, wrapper_tcl_path]:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except:
+                    pass
+
+    def extract_and_export_sta_report(self, script_path: str, output_dir: Optional[str] = None,
+                                      auto_generate: bool = True) -> Optional[str]:
+        script_dir = os.path.dirname(os.path.abspath(script_path))
+        sta_report_path = os.path.join(script_dir, "sta_report.txt")
+
+        if not os.path.exists(sta_report_path) or os.path.getsize(sta_report_path) == 0:
+            if auto_generate:
+                print("⚠️  STA report not found. Attempting to generate...")
+                sys.stdout.flush()
+                generated_path = self._generate_sta_report(script_path)
+                if generated_path:
+                    sta_report_path = generated_path
+                else:
+                    print("❌ Could not find or generate STA report")
+                    return None
+            else:
+                print("⚠️  STA report not found")
+                return None
+
+        if not os.path.exists(sta_report_path) or os.path.getsize(sta_report_path) == 0:
+            print("❌ STA report file is empty or invalid")
+            return None
+
+        export_dir = Path(output_dir).resolve() if output_dir else Path(script_dir).resolve()
+        try:
+            export_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"❌ Failed to create export directory {export_dir}: {e}")
+            return None
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        script_base = Path(script_path).stem
+        export_filename = f"{script_base}_sta_report_{timestamp}.txt"
+        export_path = export_dir / export_filename
+
+        try:
+            shutil.copy2(sta_report_path, export_path)
+            if os.path.exists(export_path) and os.path.getsize(export_path) > 0:
+                size_bytes = os.path.getsize(export_path)
+                print(f"✅ STA report exported successfully to:\n  {export_path} ({size_bytes} bytes)")
+                return str(export_path)
+            else:
+                print("❌ Exported file is empty or invalid")
+                return None
+        except Exception as e:
+            print(f"❌ Error exporting STA report: {e}")
+            return None
+
+    def run_script(self, script_path: str, gui: bool = False, export_sta: bool = True,
+                   sta_output_dir: Optional[str] = None) -> OpenROADResult:
+        start_time = time.time()
+        sta_report_file = None
+
+        try:
+            if not self.openroad_path:
+                raise OpenROADWrapperError("OpenROAD executable not found")
+            if not os.path.exists(script_path):
+                raise OpenROADWrapperError(f"Script not found: {script_path}")
+
+            script_dir = os.path.dirname(os.path.abspath(script_path))
+            script_name = os.path.basename(script_path)
+
+            if self.use_wsl:
+                args = [self.openroad_path]
+                if gui:
+                    args.append("-gui")
+                args.append(script_name)
+                cmd = self._run_command_with_wsl(args, working_dir=script_dir)
+            else:
+                cmd = [self.openroad_path]
+                if gui:
+                    cmd.append("-gui")
+                cmd.append(script_path)
+
+            print("\n" + "=" * 70)
+            print("🚀 OPENROAD EXECUTION")
+            print("=" * 70 + "\n")
+            mode_str = "GUI" if gui else "Terminal"
+            print(f"📋 Mode: {mode_str}")
+            print(f"📄 Script: {script_name}")
+            print(f"📂 Directory: {script_dir}\n")
+
+            print("▶️  Running OpenROAD...\n")
+            print("-" * 70)
+            sys.stdout.flush()
+
+            if gui:
+                subprocess.run(cmd, check=True)
+                execution_time = time.time() - start_time
+                print("-" * 70)
+                print(f"\n✅ OpenROAD GUI session completed")
+                print(f"⏱️  Time: {execution_time:.2f}s\n")
+                sys.stdout.flush()
+                if export_sta:
+                    print("📊 Processing STA report...\n")
+                    sys.stdout.flush()
+                    sta_report_file = self.extract_and_export_sta_report(
+                        script_path,
+                        sta_output_dir,
+                        auto_generate=True
+                    )
+                return OpenROADResult(success=True, stage="completed",
+                                      sta_report_file=sta_report_file,
+                                      execution_time=execution_time)
+            else:
+                result = subprocess.run(cmd, check=True, cwd=script_dir,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        text=True)
+                execution_time = time.time() - start_time
+
+                if result.stdout:
+                    print(result.stdout)
+                if result.stderr:
+                    print(result.stderr)
+
+                print("-" * 70)
+                print(f"\n✅ Script executed successfully")
+                print(f"⏱️  Time: {execution_time:.2f}s")
+                sys.stdout.flush()
+
+                if export_sta:
+                    print("\n📊 Processing STA report...")
+                    sys.stdout.flush()
+                    if result.stdout and ("timing" in result.stdout.lower() or "slack" in result.stdout.lower()):
+                        # Optional: you can extract timing info from stdout here if needed
+                        pass
+                    sta_report_file = self.extract_and_export_sta_report(
+                        script_path,
+                        sta_output_dir,
+                        auto_generate=True
+                    )
+                return OpenROADResult(success=True, stage="completed",
+                                      stdout=result.stdout, stderr=result.stderr,
+                                      sta_report_file=sta_report_file,
+                                      execution_time=execution_time)
+
+        except FileNotFoundError:
+            execution_time = time.time() - start_time
+            print("-" * 70)
+            print(f"\n❌ File not found")
+            print(f"⏱️  Time: {execution_time:.2f}s\n")
+            sys.stdout.flush()
+            return OpenROADResult(success=False, stage="error",
+                                 execution_time=execution_time)
+
+        except PermissionError:
+            execution_time = time.time() - start_time
+            print("-" * 70)
+            print(f"\n❌ Permission denied")
+            print(f"⏱️  Time: {execution_time:.2f}s\n")
+            sys.stdout.flush()
+            return OpenROADResult(success=False, stage="error",
+                                 execution_time=execution_time)
+
+        except subprocess.CalledProcessError as e:
+            execution_time = time.time() - start_time
+            print("-" * 70)
+            print(f"\n❌ OpenROAD failed with exit code {e.returncode}")
+            print(f"⏱️  Time: {execution_time:.2f}s\n")
+            sys.stdout.flush()
+            return OpenROADResult(success=False, stage="error",
+                                 execution_time=execution_time)
+
+        except Exception as e:
+            execution_time = time.time() - start_time
+            print("-" * 70)
+            print(f"\n❌ Error: {str(e)}")
+            print(f"⏱️  Time: {execution_time:.2f}s\n")
+            sys.stdout.flush()
+            return OpenROADResult(success=False, stage="error",
+                                 execution_time=execution_time)
+
+
+def main():
+    try:
+        print("\n" + "=" * 70)
+        print("OPENROAD - P&R TOOL")
+        print("=" * 70)
+        sys.stdout.flush()
+
+        openroad = OpenROADWrapper()
+
+        if not openroad.openroad_path:
+            print("\n❌ OpenROAD not found on system")
+            print("   Please ensure OpenROAD is installed and WSL is available")
+            sys.stdout.flush()
+            return
+
+        script_path = openroad.get_script_path_interactive()
+
+        print("=" * 70)
+        print("⚙️  EXECUTION MODE")
+        print("=" * 70)
+
+        print("\n1. GUI Mode     - Interactive OpenROAD interface")
+        print("2. Terminal     - Run in batch mode")
+        sys.stdout.flush()
+
+        mode = input("\nChoose mode (1 or 2, default: 1): ").strip()
+        sys.stdout.flush()
+        use_gui = mode != "2"
+
+        print("\n" + "=" * 70)
+        print("💾 STA REPORT EXPORT")
+        print("=" * 70)
+        sys.stdout.flush()
+
+        export_sta = input("\nExport STA report? (y/n, default: y): ").strip().lower()
+        sys.stdout.flush()
+        export_sta = export_sta != 'n'
+
+        sta_output_dir = None
+        if export_sta:
+            print("\n📂 STA report export directory:")
+            print("   (Press Enter to use script directory)")
+            sys.stdout.flush()
+            sta_dir = input("\nExport directory: ").strip()
+            sys.stdout.flush()
+            if sta_dir:
+                sta_output_dir = sta_dir
+                print(f"✅ STA reports will be exported to: {sta_output_dir}\n")
+            else:
+                print("✅ STA reports will be exported to script directory\n")
+            sys.stdout.flush()
+
+        result = openroad.run_script(script_path,
+                                    gui=use_gui,
+                                    export_sta=export_sta,
+                                    sta_output_dir=sta_output_dir)
+
+        print("\n" + "=" * 70)
+        print("✅ EXECUTION COMPLETE" if result.success else "❌ EXECUTION FAILED")
+        print("=" * 70)
+        sys.stdout.flush()
+
+        if result.sta_report_file:
+            print("\n📊 STA Report Information:")
+            print(f"   📄 File: {Path(result.sta_report_file).name}")
+            print(f"   📂 Location: {result.sta_report_file}\n")
+            sys.stdout.flush()
+
+    except KeyboardInterrupt:
+        print("\n⚠️  Interrupted by user\n")
+        sys.stdout.flush()
+    except OpenROADWrapperError as e:
+        print(f"\n❌ Error: {e}\n")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"\n❌ Unexpected error: {e}\n")
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
+
